@@ -1,0 +1,113 @@
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 7f2e2a09ebbd..05df4236c0b1 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -285,6 +285,10 @@ struct kvm_vcpu {
+ 	struct kvm_vcpu_stat stat;
+ 	unsigned int halt_poll_ns;
+ 	bool valid_wakeup;
++    
++    u64 last_exit_start;
++    u64 total_exit_time;
++    bool absorb_exit_time;
+ 
+ #ifdef CONFIG_HAS_IOMEM
+ 	int mmio_needed;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index bacfc9e94a62..6adc9f3217e1 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3231,11 +3231,11 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		 * On userspace reads and writes, however, we unconditionally
+ 		 * operate L1's TSC value to ensure backwards-compatible
+ 		 * behavior for migration.
++         * 
++         * LOLNO we hack this to pieces.
+ 		 */
+-		u64 tsc_offset = msr_info->host_initiated ? vcpu->arch.l1_tsc_offset :
+-							    vcpu->arch.tsc_offset;
+ 
+-		msr_info->data = kvm_scale_tsc(vcpu, rdtsc()) + tsc_offset;
++		msr_info->data = vcpu->last_exit_start - vcpu->total_exit_time;
+ 		break;
+ 	}
+ 	case MSR_MTRRcap:
+@@ -8368,7 +8368,7 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
+  * exiting to the userspace.  Otherwise, the value will be returned to the
+  * userspace.
+  */
+-static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
++static int vcpu_enter_guest_real(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+ 	bool req_int_win =
+@@ -8665,6 +8665,21 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	return r;
+ }
+ 
++static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
++{
++    int result;
++    
++    vcpu->last_exit_start = rdtsc();
++    result = vcpu_enter_guest_real(vcpu);
++    if (vcpu->absorb_exit_time)
++    {
++        vcpu->total_exit_time += rdtsc() - vcpu->last_exit_start;
++        vcpu->absorb_exit_time = false;
++    }
++    
++    return result;
++}
++
+ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+ {
+ 	if (!kvm_arch_vcpu_runnable(vcpu) &&
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 96979c09ebd1..29c3ef937d0c 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2440,7 +2440,8 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf,
+ 	      CPU_BASED_MWAIT_EXITING |
+ 	      CPU_BASED_MONITOR_EXITING |
+ 	      CPU_BASED_INVLPG_EXITING |
+-	      CPU_BASED_RDPMC_EXITING;
++	      CPU_BASED_RDPMC_EXITING |
++	      CPU_BASED_RDTSC_EXITING;
+ 
+ 	opt = CPU_BASED_TPR_SHADOW |
+ 	      CPU_BASED_USE_MSR_BITMAPS |
+@@ -5691,6 +5692,17 @@ static int handle_encls(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++static int handle_rdtsc(struct kvm_vcpu *vcpu) 
++{ 
++    u64 rdtsc_fake = vcpu->last_exit_start - vcpu->total_exit_time;
++
++    vcpu->arch.regs[VCPU_REGS_RAX] = rdtsc_fake & -1u;
++    vcpu->arch.regs[VCPU_REGS_RDX] = (rdtsc_fake >> 32) & -1u;
++    
++    return skip_emulated_instruction(vcpu);
++}
++
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -5747,6 +5759,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[EXIT_REASON_VMFUNC]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_PREEMPTION_TIMER]	      = handle_preemption_timer,
+ 	[EXIT_REASON_ENCLS]		      = handle_encls,
++    [EXIT_REASON_RDTSC]           = handle_rdtsc,
+ };
+ 
+ static const int kvm_vmx_max_exit_handlers =
+@@ -5987,6 +6000,7 @@ void dump_vmcs(void)
+  */
+ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ {
++    vcpu->absorb_exit_time = true;
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	u32 exit_reason = vmx->exit_reason;
+ 	u32 vectoring_info = vmx->idt_vectoring_info;
